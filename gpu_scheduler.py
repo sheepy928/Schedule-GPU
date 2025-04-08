@@ -681,7 +681,7 @@ class SchedulerServer:
             elif data.startswith("> help"):
                 response = "Available commands:\n"
                 response += "  > queue <command>: Queue a command\n"
-                response += "  > prioritize <job_id|#local_id> [priority]: Change job priority (lower = higher priority)\n"
+                response += "  > prioritize <job_id|#local_id> \[priority]: Change job priority (lower = higher priority)\n"
                 response += "  > status [job_id|#local_id]: Get status of a job or all jobs\n"
                 response += "  > log <job_id|#local_id>: Display full stdout and stderr logs for a job\n"
                 response += "  > help: Show this help message\n"
@@ -818,7 +818,7 @@ def main():
             f"The scheduler is also available via socket server at [blue]{args.host}:{args.port}[/blue]\n\n"
             "Available commands:\n"
             "  [cyan]queue <command>[/cyan]: Queue a command\n"
-            "  [cyan]prioritize <job_id|#local_id> [priority][/cyan]: Change job priority (lower = higher priority)\n"
+            "  [cyan]prioritize <job_id|#local_id> \[priority][/cyan]: Change job priority (lower = higher priority)\n"
             "  [cyan]status [job_id|#local_id][/cyan]: Get status of a job or all jobs\n"
             "  [cyan]log <job_id|#local_id>[/cyan]: Display full stdout and stderr logs for a job\n"
             "  [cyan]help[/cyan]: Show this help message\n"
@@ -889,7 +889,7 @@ def main():
                     help_table.add_column("Command", style="cyan")
                     help_table.add_column("Description")
                     help_table.add_row("queue <command>", "Queue a command")
-                    help_table.add_row("prioritize <job_id|#local_id> [priority]", "Change job priority (lower = higher priority)")
+                    help_table.add_row("prioritize <job_id|#local_id> \[priority]", "Change job priority (lower = higher priority)")
                     help_table.add_row("status [job_id|#local_id]", "Get status of a job or all jobs")
                     help_table.add_row("log <job_id|#local_id>", "Display full stdout and stderr logs for a job")
                     help_table.add_row("help", "Show this help message")
