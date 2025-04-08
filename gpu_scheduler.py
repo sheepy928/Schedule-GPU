@@ -15,6 +15,11 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.traceback import install
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.styles import Style
+from prompt_toolkit.completion import WordCompleter
 
 # Install rich traceback handler
 install()
@@ -752,9 +757,53 @@ def main():
                 title="GPU Scheduler Server",
                 border_style="green"
             ))
-            # Keep the main thread alive
+            
+            # Even in server-only mode, provide a basic interactive CLI
+            console.print("[yellow]Server-only mode is active, but you can still enter commands.[/yellow]")
+            console.print("[yellow]Type 'exit' to quit, or 'help' for available commands.[/yellow]")
+            
             while True:
-                time.sleep(1)
+                try:
+                    user_input = input("\n> ").strip()
+                    
+                    if user_input.lower() == "exit" or user_input.lower() == "quit":
+                        break
+                    elif user_input.lower() == "help":
+                        console.print("Available commands in server-only mode:")
+                        console.print("  [cyan]status[/cyan]: Show GPU and job status")
+                        console.print("  [cyan]exit[/cyan]: Exit the scheduler")
+                    elif user_input.lower() == "status":
+                        status_data = scheduler.get_status()
+                        
+                        # Display GPU status
+                        status_table = Table(title="GPU Status")
+                        status_table.add_column("GPU ID", style="cyan")
+                        status_table.add_column("Status")
+                        
+                        for gpu_id, status in status_data["gpu_status"].items():
+                            status_color = "green" if status == "free" else "yellow"
+                            status_table.add_row(str(gpu_id), f"[{status_color}]{status}[/{status_color}]")
+                        
+                        console.print(status_table)
+                        
+                        # Display queue and job counts
+                        if status_data["queue_size"] > 0:
+                            console.print(f"Jobs in queue: [yellow]{status_data['queue_size']}[/yellow]")
+                            
+                        status_counts = status_data.get("status_counts", {})
+                        if status_counts:
+                            console.print("Job status counts:")
+                            for status, count in status_counts.items():
+                                status_color = "green" if status == "completed" else ("red" if status == "failed" else "yellow")
+                                console.print(f"  [{status_color}]{status}[/{status_color}]: {count}")
+                    elif user_input:
+                        console.print("[bold red]Unknown command.[/bold red] Type [cyan]help[/cyan] for available commands.")
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    console.print(f"[bold red]Error:[/bold red] {str(e)}")
+                    
+            console.print("\n[yellow]Shutting down...[/yellow]")
         except KeyboardInterrupt:
             console.print("\n[yellow]Shutting down...[/yellow]")
         finally:
@@ -773,166 +822,236 @@ def main():
             "  [cyan]status [job_id|#local_id][/cyan]: Get status of a job or all jobs\n"
             "  [cyan]log <job_id|#local_id>[/cyan]: Display full stdout and stderr logs for a job\n"
             "  [cyan]help[/cyan]: Show this help message\n"
-            "  [cyan]exit[/cyan]: Exit the scheduler"
+            "  [cyan]exit[/cyan]: Exit the scheduler\n\n"
+            "Keyboard shortcuts:\n"
+            "  [magenta]↑/↓[/magenta]: Navigate command history\n"
+            "  [magenta]←/→[/magenta]: Move cursor within command\n"
+            "  [magenta]Tab[/magenta]: Complete commands\n"
+            "  [magenta]Ctrl+C[/magenta]: Cancel current input\n"
+            "  [magenta]Ctrl+D[/magenta]: Exit the scheduler"
         )
         console.print(Panel(panel_content, title="GPU Scheduler", border_style="green"))
         
+        # Initialize prompt_toolkit session with history
+        command_history = InMemoryHistory()
+        prompt_style = Style.from_dict({
+            'prompt': 'bold green',
+        })
+        
+        # Set up command completion
+        command_completer = WordCompleter([
+            'help', 'exit', 'quit', 
+            'queue', 'status', 'log', 'prioritize',
+        ], ignore_case=True)
+        
+        session = PromptSession(
+            history=command_history,
+            auto_suggest=AutoSuggestFromHistory(),
+            style=prompt_style,
+            completer=command_completer
+        )
+        
+        # Store command history for fallback mode
+        fallback_history = []
+        use_fallback = False
+        
         while True:
-            user_input = console.input("[bold green]>[/bold green] ").strip()
-            
-            if user_input.lower() == "exit" or user_input.lower() == "quit":
-                break
-            elif user_input.lower() == "help":
-                help_table = Table(title="Available Commands")
-                help_table.add_column("Command", style="cyan")
-                help_table.add_column("Description")
-                help_table.add_row("queue <command>", "Queue a command")
-                help_table.add_row("prioritize <job_id|#local_id> [priority]", "Change job priority (lower = higher priority)")
-                help_table.add_row("status [job_id|#local_id]", "Get status of a job or all jobs")
-                help_table.add_row("log <job_id|#local_id>", "Display full stdout and stderr logs for a job")
-                help_table.add_row("help", "Show this help message")
-                help_table.add_row("exit", "Exit the scheduler")
-                console.print(help_table)
-            elif user_input.lower().startswith("status"):
-                parts = user_input.split(maxsplit=1)
-                job_id = parts[1] if len(parts) > 1 else None
-                
-                status_data = scheduler.get_status(job_id)
-                
-                if job_id:
-                    # Single job status
-                    if "error" in status_data:
-                        console.print(f"[bold red]{status_data['error']}[/bold red]")
-                    else:
-                        status_color = "green" if status_data.get("status") == "completed" else (
-                            "red" if status_data.get("status") == "failed" else "yellow")
-                        
-                        status_panel = Panel(
-                            f"Job ID: [cyan]{status_data['job_id']}[/cyan] (#{status_data['local_id']})\n"
-                            f"Priority: {status_data.get('priority', 'N/A')}\n"
-                            f"Command: [dim]{status_data.get('command', 'N/A')}[/dim]\n"
-                            f"Status: [bold {status_color}]{status_data['status']}[/bold {status_color}]\n"
-                            + (f"Return Code: {status_data.get('return_code', 'N/A')}\n" if "return_code" in status_data else "")
-                            + (f"Stdout: {status_data.get('stdout', 'N/A')}\n" if "stdout" in status_data else "")
-                            + (f"Stderr: {status_data.get('stderr', 'N/A')}" if "stderr" in status_data else ""),
-                            title="Job Status",
-                            border_style=status_color
-                        )
-                        console.print(status_panel)
+            try:
+                # Get user input (with or without prompt_toolkit based on fallback flag)
+                if use_fallback:
+                    # Fallback to standard input if prompt_toolkit doesn't work
+                    console.print("[bold green]>[/bold green] ", end="")
+                    user_input = input().strip()
+                    
+                    # Simple history navigation with standard input
+                    if user_input == "!!" and fallback_history:
+                        user_input = fallback_history[-1]
+                        console.print(f"[dim]Executing: {user_input}[/dim]")
                 else:
-                    # All jobs status
-                    status_table = Table(title="GPU Status")
-                    status_table.add_column("GPU ID", style="cyan")
-                    status_table.add_column("Status")
-                    
-                    for gpu_id, status in status_data["gpu_status"].items():
-                        status_color = "green" if status == "free" else "yellow"
-                        status_table.add_row(str(gpu_id), f"[{status_color}]{status}[/{status_color}]")
-                    
-                    console.print(status_table)
-                    
-                    if status_data["queue_size"] > 0:
-                        console.print(f"Jobs in queue: [yellow]{status_data['queue_size']}[/yellow]")
-                    
-                    if status_data["jobs"]:
-                        jobs_table = Table(title="Jobs")
-                        jobs_table.add_column("Local ID", style="cyan")
-                        jobs_table.add_column("Job ID", style="dim")
-                        jobs_table.add_column("Status")
-                        jobs_table.add_column("Priority")
-                        jobs_table.add_column("Command", style="dim")
-                        
-                        for job_id, status in status_data["jobs"].items():
-                            status_color = "green" if status == "completed" else (
-                                "red" if status == "failed" else "yellow")
-                            local_id = status_data["local_ids"].get(job_id, "?")
-                            priority = status_data["job_priorities"].get(job_id, "N/A")
-                            command = status_data["commands"].get(job_id, "Unknown command")
-                            # Truncate command if too long
-                            if len(command) > 40:
-                                command = command[:37] + "..."
-                            jobs_table.add_row(
-                                f"#{local_id}", 
-                                job_id, 
-                                f"[{status_color}]{status}[/{status_color}]",
-                                str(priority),
-                                command
-                            )
-                        
-                        console.print(jobs_table)
-            elif user_input.lower().startswith("log "):
-                parts = user_input.split(maxsplit=1)
-                if len(parts) < 2:
-                    console.print("[bold red]Error:[/bold red] Usage: log <job_id|#local_id>")
-                else:
-                    job_id = parts[1]
-                    log_data = scheduler.get_log(job_id)
-                    
-                    if "error" in log_data:
-                        console.print(f"[bold red]Error:[/bold red] {log_data['error']}")
-                    else:
-                        status_color = "green" if log_data.get("status") == "completed" else (
-                            "red" if log_data.get("status") == "failed" else "yellow")
-                        
-                        # Create a panel for job details
-                        details_content = [
-                            f"Job ID: [cyan]{log_data['job_id']}[/cyan] (#{log_data['local_id']})",
-                            f"Status: [bold {status_color}]{log_data['status']}[/bold {status_color}]"
-                        ]
-                        
-                        if "message" in log_data:
-                            details_content.append(f"{log_data['message']}")
-                        
-                        if "command" in log_data:
-                            details_content.append(f"Command: [dim]{log_data['command']}[/dim]")
-                        
-                        if "return_code" in log_data:
-                            details_content.append(f"Return Code: {log_data['return_code']}")
-                        
-                        details_panel = Panel("\n".join(details_content), 
-                                            title="Job Details", 
-                                            border_style=status_color)
-                        console.print(details_panel)
-                        
-                        # Show stdout in a separate panel if available
-                        if "stdout" in log_data and log_data["stdout"].strip():
-                            stdout_panel = Panel(log_data["stdout"], 
-                                                title="STDOUT", 
-                                                border_style="green")
-                            console.print(stdout_panel)
-                        elif "stdout" in log_data:
-                            console.print("[dim]No output in stdout.[/dim]")
-                        
-                        # Show stderr in a separate panel if available and not empty
-                        if "stderr" in log_data and log_data["stderr"].strip():
-                            stderr_panel = Panel(log_data["stderr"], 
-                                                title="STDERR", 
-                                                border_style="red")
-                            console.print(stderr_panel)
-                        elif "stderr" in log_data:
-                            console.print("[dim]No output in stderr.[/dim]")
-            elif user_input.lower().startswith("queue "):
-                command = user_input[6:].strip()
-                job_id = scheduler.enqueue(command)
-                local_id = scheduler.uuid_to_local.get(job_id)
-                console.print(f"Job submitted with ID: [cyan]{job_id}[/cyan] (#{local_id})")
-            elif user_input.lower().startswith("prioritize "):
-                parts = user_input.split(maxsplit=2)
-                if len(parts) < 2:
-                    console.print("[bold red]Error:[/bold red] Usage: prioritize <job_id|#local_id> [priority]")
-                else:
-                    job_id = parts[1]
+                    # Try to use prompt_toolkit with a simple prompt and message
                     try:
-                        priority = int(parts[2]) if len(parts) > 2 else 10
-                        result = scheduler.prioritize(job_id, priority)
-                        if "error" in result:
-                            console.print(f"[bold red]Error:[/bold red] {result['error']}")
+                        # Using a simple ">" prompt that works reliably
+                        user_input = session.prompt("\n> ", complete_while_typing=True).strip()
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Falling back to standard input due to error: {str(e)}[/yellow]")
+                        use_fallback = True
+                        console.print("[bold green]>[/bold green] ", end="")
+                        user_input = input().strip()
+                
+                # Store command in history (if not empty)
+                if user_input and user_input not in fallback_history:
+                    fallback_history.append(user_input)
+                
+                if user_input.lower() == "exit" or user_input.lower() == "quit":
+                    break
+                elif user_input.lower() == "help":
+                    help_table = Table(title="Available Commands")
+                    help_table.add_column("Command", style="cyan")
+                    help_table.add_column("Description")
+                    help_table.add_row("queue <command>", "Queue a command")
+                    help_table.add_row("prioritize <job_id|#local_id> [priority]", "Change job priority (lower = higher priority)")
+                    help_table.add_row("status [job_id|#local_id]", "Get status of a job or all jobs")
+                    help_table.add_row("log <job_id|#local_id>", "Display full stdout and stderr logs for a job")
+                    help_table.add_row("help", "Show this help message")
+                    help_table.add_row("exit", "Exit the scheduler")
+                    console.print(help_table)
+                    
+                    # Also show keyboard shortcuts
+                    shortcuts_table = Table(title="Keyboard Shortcuts")
+                    shortcuts_table.add_column("Key", style="magenta")
+                    shortcuts_table.add_column("Action")
+                    shortcuts_table.add_row("↑/↓", "Navigate command history")
+                    shortcuts_table.add_row("←/→", "Move cursor within command")
+                    shortcuts_table.add_row("Tab", "Complete commands")
+                    shortcuts_table.add_row("Ctrl+C", "Cancel current input")
+                    shortcuts_table.add_row("Ctrl+D", "Exit the scheduler")
+                    console.print(shortcuts_table)
+                elif user_input.lower().startswith("status"):
+                    parts = user_input.split(maxsplit=1)
+                    job_id = parts[1] if len(parts) > 1 else None
+                    
+                    status_data = scheduler.get_status(job_id)
+                    
+                    if job_id:
+                        # Single job status
+                        if "error" in status_data:
+                            console.print(f"[bold red]{status_data['error']}[/bold red]")
                         else:
-                            console.print(f"Job prioritized: #{result['local_id']} [cyan]{result['job_id']}[/cyan] (priority: {result['new_priority']})")
-                    except ValueError:
-                        console.print("[bold red]Error:[/bold red] Priority must be an integer")
-            else:
-                console.print("[bold red]Unknown command.[/bold red] Type [cyan]help[/cyan] for available commands.")
+                            status_color = "green" if status_data.get("status") == "completed" else (
+                                "red" if status_data.get("status") == "failed" else "yellow")
+                            
+                            status_panel = Panel(
+                                f"Job ID: [cyan]{status_data['job_id']}[/cyan] (#{status_data['local_id']})\n"
+                                f"Priority: {status_data.get('priority', 'N/A')}\n"
+                                f"Command: [dim]{status_data.get('command', 'N/A')}[/dim]\n"
+                                f"Status: [bold {status_color}]{status_data['status']}[/bold {status_color}]\n"
+                                + (f"Return Code: {status_data.get('return_code', 'N/A')}\n" if "return_code" in status_data else "")
+                                + (f"Stdout: {status_data.get('stdout', 'N/A')}\n" if "stdout" in status_data else "")
+                                + (f"Stderr: {status_data.get('stderr', 'N/A')}" if "stderr" in status_data else ""),
+                                title="Job Status",
+                                border_style=status_color
+                            )
+                            console.print(status_panel)
+                    else:
+                        # All jobs status
+                        status_table = Table(title="GPU Status")
+                        status_table.add_column("GPU ID", style="cyan")
+                        status_table.add_column("Status")
+                        
+                        for gpu_id, status in status_data["gpu_status"].items():
+                            status_color = "green" if status == "free" else "yellow"
+                            status_table.add_row(str(gpu_id), f"[{status_color}]{status}[/{status_color}]")
+                        
+                        console.print(status_table)
+                        
+                        if status_data["queue_size"] > 0:
+                            console.print(f"Jobs in queue: [yellow]{status_data['queue_size']}[/yellow]")
+                        
+                        if status_data["jobs"]:
+                            jobs_table = Table(title="Jobs")
+                            jobs_table.add_column("Local ID", style="cyan")
+                            jobs_table.add_column("Job ID", style="dim")
+                            jobs_table.add_column("Status")
+                            jobs_table.add_column("Priority")
+                            jobs_table.add_column("Command", style="dim")
+                            
+                            for job_id, status in status_data["jobs"].items():
+                                status_color = "green" if status == "completed" else (
+                                    "red" if status == "failed" else "yellow")
+                                local_id = status_data["local_ids"].get(job_id, "?")
+                                priority = status_data["job_priorities"].get(job_id, "N/A")
+                                command = status_data["commands"].get(job_id, "Unknown command")
+                                # Truncate command if too long
+                                if len(command) > 40:
+                                    command = command[:37] + "..."
+                                jobs_table.add_row(
+                                    f"#{local_id}", 
+                                    job_id, 
+                                    f"[{status_color}]{status}[/{status_color}]",
+                                    str(priority),
+                                    command
+                                )
+                            
+                            console.print(jobs_table)
+                elif user_input.lower().startswith("log "):
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[bold red]Error:[/bold red] Usage: log <job_id|#local_id>")
+                    else:
+                        job_id = parts[1]
+                        log_data = scheduler.get_log(job_id)
+                        
+                        if "error" in log_data:
+                            console.print(f"[bold red]Error:[/bold red] {log_data['error']}")
+                        else:
+                            status_color = "green" if log_data.get("status") == "completed" else (
+                                "red" if log_data.get("status") == "failed" else "yellow")
+                            
+                            # Create a panel for job details
+                            details_content = [
+                                f"Job ID: [cyan]{log_data['job_id']}[/cyan] (#{log_data['local_id']})",
+                                f"Status: [bold {status_color}]{log_data['status']}[/bold {status_color}]"
+                            ]
+                            
+                            if "message" in log_data:
+                                details_content.append(f"{log_data['message']}")
+                            
+                            if "command" in log_data:
+                                details_content.append(f"Command: [dim]{log_data['command']}[/dim]")
+                            
+                            if "return_code" in log_data:
+                                details_content.append(f"Return Code: {log_data['return_code']}")
+                            
+                            details_panel = Panel("\n".join(details_content), 
+                                                title="Job Details", 
+                                                border_style=status_color)
+                            console.print(details_panel)
+                            
+                            # Show stdout in a separate panel if available
+                            if "stdout" in log_data and log_data["stdout"].strip():
+                                stdout_panel = Panel(log_data["stdout"], 
+                                                    title="STDOUT", 
+                                                    border_style="green")
+                                console.print(stdout_panel)
+                            elif "stdout" in log_data:
+                                console.print("[dim]No output in stdout.[/dim]")
+                            
+                            # Show stderr in a separate panel if available and not empty
+                            if "stderr" in log_data and log_data["stderr"].strip():
+                                stderr_panel = Panel(log_data["stderr"], 
+                                                    title="STDERR", 
+                                                    border_style="red")
+                                console.print(stderr_panel)
+                            elif "stderr" in log_data:
+                                console.print("[dim]No output in stderr.[/dim]")
+                elif user_input.lower().startswith("queue "):
+                    command = user_input[6:].strip()
+                    job_id = scheduler.enqueue(command)
+                    local_id = scheduler.uuid_to_local.get(job_id)
+                    console.print(f"Job submitted with ID: [cyan]{job_id}[/cyan] (#{local_id})")
+                elif user_input.lower().startswith("prioritize "):
+                    parts = user_input.split(maxsplit=2)
+                    if len(parts) < 2:
+                        console.print("[bold red]Error:[/bold red] Usage: prioritize <job_id|#local_id> [priority]")
+                    else:
+                        job_id = parts[1]
+                        try:
+                            priority = int(parts[2]) if len(parts) > 2 else 10
+                            result = scheduler.prioritize(job_id, priority)
+                            if "error" in result:
+                                console.print(f"[bold red]Error:[/bold red] {result['error']}")
+                            else:
+                                console.print(f"Job prioritized: #{result['local_id']} [cyan]{result['job_id']}[/cyan] (priority: {result['new_priority']})")
+                        except ValueError:
+                            console.print("[bold red]Error:[/bold red] Priority must be an integer")
+                elif user_input:  # Only show error for non-empty input
+                    console.print("[bold red]Unknown command.[/bold red] Type [cyan]help[/cyan] for available commands.")
+            except KeyboardInterrupt:
+                # Handle Ctrl+C during input (allow canceling current input)
+                continue
+            except EOFError:
+                # Handle Ctrl+D (exit)
+                break
     
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
