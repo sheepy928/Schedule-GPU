@@ -149,6 +149,8 @@ class GPUJobScheduler:
         self.job_commands = {}  # job_id -> command
         self.job_results = {}  # job_id -> (return_code, stdout, stderr)
         self.job_priorities = {}  # job_id -> priority
+        self.job_gpus = {}  # job_id -> requested GPU ID
+        self.job_processes = {}  # job_id -> process object for running jobs
         self.stop_event = threading.Event()
         
         # Create log directory if it doesn't exist
@@ -192,17 +194,21 @@ class GPUJobScheduler:
             # Sleep before next check
             time.sleep(self.status_check_interval)
                     
-    def enqueue(self, command: str, priority: int = 100) -> str:
+    def enqueue(self, command: str, priority: int = 100, gpu_id: Optional[int] = None) -> str:
         """
         Add a command to the queue.
         
         Args:
             command: The command to run
             priority: Priority level (lower values = higher priority, default: 100)
+            gpu_id: Specific GPU ID to run this job on (default: None, meaning any available GPU)
             
         Returns:
             job_id: Unique ID for the job
         """
+        if gpu_id is not None and gpu_id not in self.gpu_ids:
+            raise ValueError(f"GPU ID {gpu_id} is not available. Available GPUs: {self.gpu_ids}")
+            
         job_id = str(uuid.uuid4())
         local_id = self.next_local_id
         self.next_local_id += 1
@@ -214,12 +220,14 @@ class GPUJobScheduler:
         self.job_status[job_id] = "queued"
         self.job_commands[job_id] = command  # Store the command
         self.job_priorities[job_id] = priority
+        self.job_gpus[job_id] = gpu_id  # Store preferred GPU (can be None)
         
         # Add to priority queue: (priority, local_id, job_id, command)
         # Local ID added to tiebreak equal priorities based on FIFO order
         self.queue.put((priority, local_id, job_id, command))
         
-        console.print(f"Job #{local_id} [cyan]{job_id}[/cyan] [bold]queued[/bold] (priority: {priority}): [dim]{command}[/dim]")
+        gpu_msg = f" on GPU {gpu_id}" if gpu_id is not None else ""
+        console.print(f"Job #{local_id} [cyan]{job_id}[/cyan] [bold]queued[/bold]{gpu_msg} (priority: {priority}): [dim]{command}[/dim]")
         return job_id
     
     def prioritize(self, job_identifier: str, new_priority: int = 10) -> Dict[str, Any]:
@@ -289,6 +297,151 @@ class GPUJobScheduler:
             "new_priority": new_priority
         }
     
+    def cancel_job(self, job_identifier: str) -> Dict[str, Any]:
+        """
+        Cancel a queued job.
+        
+        Args:
+            job_identifier: Local ID (as string with # prefix) or UUID of the job
+            
+        Returns:
+            Result dictionary with status information
+        """
+        # Determine if using local ID or UUID
+        job_id = None
+        local_id = None
+        
+        if job_identifier.startswith('#'):
+            try:
+                local_id = int(job_identifier[1:])
+                if local_id in self.local_to_uuid:
+                    job_id = self.local_to_uuid[local_id]
+                else:
+                    return {"error": f"Local job ID {local_id} not found"}
+            except ValueError:
+                return {"error": f"Invalid local job ID format: {job_identifier}"}
+        else:
+            job_id = job_identifier
+            if job_id not in self.job_status:
+                return {"error": f"Job ID {job_id} not found"}
+            local_id = self.uuid_to_local.get(job_id)
+        
+        # Check if the job is in the queue (can only cancel queued jobs)
+        if self.job_status[job_id] != "queued":
+            return {"error": f"Can only cancel queued jobs. Job #{local_id} is '{self.job_status[job_id]}'"}
+        
+        # Create a new queue without the job to cancel
+        new_queue = queue.PriorityQueue()
+        job_found = False
+        
+        while not self.queue.empty():
+            try:
+                priority, item_local_id, item_job_id, item_command = self.queue.get(block=False)
+                
+                # If this is not our target job, keep it in the queue
+                if item_job_id != job_id:
+                    new_queue.put((priority, item_local_id, item_job_id, item_command))
+                else:
+                    job_found = True
+            except queue.Empty:
+                break
+        
+        # Replace the old queue with our new one
+        self.queue = new_queue
+        
+        # Update job status if the job was found
+        if job_found:
+            self.job_status[job_id] = "cancelled"
+            console.print(f"Job #{local_id} [cyan]{job_id}[/cyan] has been [bold red]cancelled[/bold red]")
+            return {
+                "job_id": job_id,
+                "local_id": local_id,
+                "status": "cancelled"
+            }
+        else:
+            return {"error": f"Job #{local_id} not found in the queue"}
+    
+    def kill_job(self, job_identifier: str) -> Dict[str, Any]:
+        """
+        Kill a running job.
+        
+        Args:
+            job_identifier: Local ID (as string with # prefix) or UUID of the job
+            
+        Returns:
+            Result dictionary with status information
+        """
+        # Determine if using local ID or UUID
+        job_id = None
+        local_id = None
+        
+        if job_identifier.startswith('#'):
+            try:
+                local_id = int(job_identifier[1:])
+                if local_id in self.local_to_uuid:
+                    job_id = self.local_to_uuid[local_id]
+                else:
+                    return {"error": f"Local job ID {local_id} not found"}
+            except ValueError:
+                return {"error": f"Invalid local job ID format: {job_identifier}"}
+        else:
+            job_id = job_identifier
+            if job_id not in self.job_status:
+                return {"error": f"Job ID {job_id} not found"}
+            local_id = self.uuid_to_local.get(job_id)
+        
+        # Check if the job is running
+        if self.job_status[job_id] != "running":
+            return {"error": f"Can only kill running jobs. Job #{local_id} is '{self.job_status[job_id]}'"}
+        
+        # Check if we have a process object for this job
+        if job_id not in self.job_processes or self.job_processes[job_id] is None:
+            return {"error": f"No process found for job #{local_id}"}
+        
+        # Attempt to kill the process
+        try:
+            process = self.job_processes[job_id]
+            process.terminate()
+            
+            # Give it a moment to terminate gracefully, then kill if needed
+            time.sleep(2)
+            if process.poll() is None:
+                # Process didn't terminate, force kill
+                process.kill()
+            
+            # Update job status
+            self.job_status[job_id] = "killed"
+            
+            # Clean up process reference
+            self.job_processes.pop(job_id, None)
+            
+            # Update logs with termination information
+            stdout_log = os.path.join(self.log_dir, f"{job_id}_stdout.log")
+            stderr_log = os.path.join(self.log_dir, f"{job_id}_stderr.log")
+            
+            try:
+                with open(stderr_log, 'a') as f:
+                    f.write("\n\n=== JOB KILLED BY USER ===\n")
+            except:
+                pass
+            
+            console.print(f"Job #{local_id} [cyan]{job_id}[/cyan] has been [bold red]killed[/bold red]")
+            
+            # Free up GPU status if the job was on this GPU
+            for gpu_id, status in self.gpu_status.items():
+                if status == "busy":
+                    current_status = check_gpu_status(gpu_id)
+                    with self.gpu_locks[gpu_id]:
+                        self.gpu_status[gpu_id] = current_status
+            
+            return {
+                "job_id": job_id,
+                "local_id": local_id,
+                "status": "killed"
+            }
+        except Exception as e:
+            return {"error": f"Failed to kill job #{local_id}: {str(e)}"}
+    
     def _gpu_worker(self, gpu_id: int):
         """
         Worker thread that executes jobs on a specific GPU.
@@ -308,6 +461,16 @@ class GPUJobScheduler:
                 try:
                     priority, local_id, job_id, command = self.queue.get(timeout=1)
                     job_acquired = True  # Flag that we got a job from the queue
+                    
+                    # Check if this job has a GPU preference
+                    preferred_gpu = self.job_gpus.get(job_id)
+                    if preferred_gpu is not None and preferred_gpu != gpu_id:
+                        # Job has a specific GPU preference and it's not this GPU
+                        # Put job back in queue and skip
+                        self.queue.put((priority, local_id, job_id, command))
+                        job_acquired = False
+                        continue
+                        
                 except queue.Empty:
                     continue
                 
@@ -347,8 +510,14 @@ class GPUJobScheduler:
                             env=env
                         )
                         
+                        # Store the process object for potential killing later
+                        self.job_processes[job_id] = process
+                        
                         # Wait for the process to complete
                         return_code = process.wait()
+                        
+                        # Remove process from tracking dict
+                        self.job_processes.pop(job_id, None)
                     
                     # Read the logs
                     with open(stdout_log, 'r') as f:
@@ -357,7 +526,12 @@ class GPUJobScheduler:
                         stderr = f.read()
                     
                     # Update job status
-                    self.job_status[job_id] = "completed" if return_code == 0 else "failed"
+                    if self.job_status[job_id] == "killed":
+                        # Job was already marked as killed, don't change status
+                        pass
+                    else:
+                        self.job_status[job_id] = "completed" if return_code == 0 else "failed"
+                    
                     self.job_results[job_id] = (return_code, stdout, stderr)
                     
                     status_color = "green" if return_code == 0 else "red"
@@ -621,10 +795,28 @@ class SchedulerServer:
             
             # Process command
             if data.startswith("> queue "):
+                # Check for GPU specification with "on gpu X" or similar pattern
                 command = data[8:].strip()
-                job_id = self.scheduler.enqueue(command)
+                gpu_id = None
+                
+                # Check for GPU specification at the end: "command on gpu X"
+                gpu_spec_match = False
+                for pattern in ["on gpu ", "on GPU ", "--gpu ", "--GPU "]:
+                    if " " + pattern in command:
+                        parts = command.split(" " + pattern)
+                        if len(parts) > 1 and parts[1].strip().isdigit():
+                            command = parts[0]
+                            try:
+                                gpu_id = int(parts[1].strip())
+                                gpu_spec_match = True
+                                break
+                            except ValueError:
+                                pass
+                
+                job_id = self.scheduler.enqueue(command, gpu_id=gpu_id)
                 local_id = self.scheduler.uuid_to_local.get(job_id)
-                response = f"Job submitted with ID: {job_id} (#{local_id})\n"
+                gpu_msg = f" on GPU {gpu_id}" if gpu_id is not None else ""
+                response = f"Job submitted with ID: {job_id} (#{local_id}){gpu_msg}\n"
             
             elif data.startswith("> prioritize "):
                 parts = data.split(maxsplit=3)
@@ -641,6 +833,30 @@ class SchedulerServer:
                             response = f"Job prioritized: #{result['local_id']} {result['job_id']} (priority: {result['new_priority']})\n"
                     except ValueError:
                         response = "Error: Priority must be an integer\n"
+            
+            elif data.startswith("> cancel "):
+                parts = data.split(maxsplit=2)
+                if len(parts) < 2:
+                    response = "Error: Usage: > cancel <job_id|#local_id>\n"
+                else:
+                    job_id = parts[1]
+                    result = self.scheduler.cancel_job(job_id)
+                    if "error" in result:
+                        response = f"Error: {result['error']}\n"
+                    else:
+                        response = f"Job cancelled: #{result['local_id']} {result['job_id']}\n"
+            
+            elif data.startswith("> kill "):
+                parts = data.split(maxsplit=2)
+                if len(parts) < 2:
+                    response = "Error: Usage: > kill <job_id|#local_id>\n"
+                else:
+                    job_id = parts[1]
+                    result = self.scheduler.kill_job(job_id)
+                    if "error" in result:
+                        response = f"Error: {result['error']}\n"
+                    else:
+                        response = f"Job killed: #{result['local_id']} {result['job_id']}\n"
             
             elif data.startswith("> log "):
                 parts = data.split(maxsplit=2)
@@ -674,14 +890,16 @@ class SchedulerServer:
             
             elif data.startswith("> status"):
                 parts = data.split(maxsplit=2)
-                job_id = parts[2] if len(parts) > 2 else None
+                job_id = parts[1] if len(parts) > 1 else None
                 status = self.scheduler.get_status(job_id)
                 response = json.dumps(status, indent=2) + "\n"
             
             elif data.startswith("> help"):
                 response = "Available commands:\n"
-                response += "  > queue <command>: Queue a command\n"
+                response += "  > queue <command> [on gpu <gpu_id>]: Queue a command (optionally on a specific GPU)\n"
                 response += "  > prioritize <job_id|#local_id> \[priority]: Change job priority (lower = higher priority)\n"
+                response += "  > cancel <job_id|#local_id>: Cancel a queued job\n"
+                response += "  > kill <job_id|#local_id>: Kill a running job\n"
                 response += "  > status [job_id|#local_id]: Get status of a job or all jobs\n"
                 response += "  > log <job_id|#local_id>: Display full stdout and stderr logs for a job\n"
                 response += "  > help: Show this help message\n"
@@ -771,6 +989,8 @@ def main():
                     elif user_input.lower() == "help":
                         console.print("Available commands in server-only mode:")
                         console.print("  [cyan]status[/cyan]: Show GPU and job status")
+                        console.print("  [cyan]cancel <job_id|#local_id>[/cyan]: Cancel a queued job")
+                        console.print("  [cyan]kill <job_id|#local_id>[/cyan]: Kill a running job")
                         console.print("  [cyan]exit[/cyan]: Exit the scheduler")
                     elif user_input.lower() == "status":
                         status_data = scheduler.get_status()
@@ -796,6 +1016,26 @@ def main():
                             for status, count in status_counts.items():
                                 status_color = "green" if status == "completed" else ("red" if status == "failed" else "yellow")
                                 console.print(f"  [{status_color}]{status}[/{status_color}]: {count}")
+                    elif user_input.lower().startswith("cancel "):
+                        parts = user_input.split(maxsplit=1)
+                        if len(parts) > 1:
+                            result = scheduler.cancel_job(parts[1])
+                            if "error" in result:
+                                console.print(f"[bold red]Error:[/bold red] {result['error']}")
+                            else:
+                                console.print(f"Job cancelled: #{result['local_id']} [cyan]{result['job_id']}[/cyan]")
+                        else:
+                            console.print("[bold red]Error:[/bold red] Please specify a job ID to cancel")
+                    elif user_input.lower().startswith("kill "):
+                        parts = user_input.split(maxsplit=1)
+                        if len(parts) > 1:
+                            result = scheduler.kill_job(parts[1])
+                            if "error" in result:
+                                console.print(f"[bold red]Error:[/bold red] {result['error']}")
+                            else:
+                                console.print(f"Job killed: #{result['local_id']} [cyan]{result['job_id']}[/cyan]")
+                        else:
+                            console.print("[bold red]Error:[/bold red] Please specify a job ID to kill")
                     elif user_input:
                         console.print("[bold red]Unknown command.[/bold red] Type [cyan]help[/cyan] for available commands.")
                 except KeyboardInterrupt:
@@ -817,8 +1057,10 @@ def main():
             "GPU Scheduler running in interactive mode. Enter commands to queue them.\n"
             f"The scheduler is also available via socket server at [blue]{args.host}:{args.port}[/blue]\n\n"
             "Available commands:\n"
-            "  [cyan]queue <command>[/cyan]: Queue a command\n"
+            "  [cyan]queue <command> [on gpu <gpu_id>][/cyan]: Queue a command (optionally on a specific GPU)\n"
             "  [cyan]prioritize <job_id|#local_id> \[priority][/cyan]: Change job priority (lower = higher priority)\n"
+            "  [cyan]cancel <job_id|#local_id>[/cyan]: Cancel a queued job\n"
+            "  [cyan]kill <job_id|#local_id>[/cyan]: Kill a running job\n"
             "  [cyan]status [job_id|#local_id][/cyan]: Get status of a job or all jobs\n"
             "  [cyan]log <job_id|#local_id>[/cyan]: Display full stdout and stderr logs for a job\n"
             "  [cyan]help[/cyan]: Show this help message\n"
@@ -841,7 +1083,8 @@ def main():
         # Set up command completion
         command_completer = WordCompleter([
             'help', 'exit', 'quit', 
-            'queue', 'status', 'log', 'prioritize',
+            'queue', 'status', 'log', 'prioritize', 'cancel', 'kill',
+            'on', 'gpu'
         ], ignore_case=True)
         
         session = PromptSession(
@@ -888,8 +1131,10 @@ def main():
                     help_table = Table(title="Available Commands")
                     help_table.add_column("Command", style="cyan")
                     help_table.add_column("Description")
-                    help_table.add_row("queue <command>", "Queue a command")
+                    help_table.add_row("queue <command> [on gpu <gpu_id>]", "Queue a command (optionally on a specific GPU)")
                     help_table.add_row("prioritize <job_id|#local_id> \[priority]", "Change job priority (lower = higher priority)")
+                    help_table.add_row("cancel <job_id|#local_id>", "Cancel a queued job")
+                    help_table.add_row("kill <job_id|#local_id>", "Kill a running job")
                     help_table.add_row("status [job_id|#local_id]", "Get status of a job or all jobs")
                     help_table.add_row("log <job_id|#local_id>", "Display full stdout and stderr logs for a job")
                     help_table.add_row("help", "Show this help message")
@@ -1026,9 +1271,27 @@ def main():
                                 console.print("[dim]No output in stderr.[/dim]")
                 elif user_input.lower().startswith("queue "):
                     command = user_input[6:].strip()
-                    job_id = scheduler.enqueue(command)
-                    local_id = scheduler.uuid_to_local.get(job_id)
-                    console.print(f"Job submitted with ID: [cyan]{job_id}[/cyan] (#{local_id})")
+                    gpu_id = None
+                    
+                    # Check for GPU specification at the end: "command on gpu X"
+                    for pattern in ["on gpu ", "on GPU ", "--gpu ", "--GPU "]:
+                        if " " + pattern in command:
+                            parts = command.split(" " + pattern)
+                            if len(parts) > 1 and parts[1].strip().isdigit():
+                                command = parts[0]
+                                try:
+                                    gpu_id = int(parts[1].strip())
+                                    break
+                                except ValueError:
+                                    pass
+                    
+                    try:
+                        job_id = scheduler.enqueue(command, gpu_id=gpu_id)
+                        local_id = scheduler.uuid_to_local.get(job_id)
+                        gpu_msg = f" on GPU {gpu_id}" if gpu_id is not None else ""
+                        console.print(f"Job submitted with ID: [cyan]{job_id}[/cyan] (#{local_id}){gpu_msg}")
+                    except ValueError as e:
+                        console.print(f"[bold red]Error:[/bold red] {str(e)}")
                 elif user_input.lower().startswith("prioritize "):
                     parts = user_input.split(maxsplit=2)
                     if len(parts) < 2:
@@ -1044,6 +1307,28 @@ def main():
                                 console.print(f"Job prioritized: #{result['local_id']} [cyan]{result['job_id']}[/cyan] (priority: {result['new_priority']})")
                         except ValueError:
                             console.print("[bold red]Error:[/bold red] Priority must be an integer")
+                elif user_input.lower().startswith("cancel "):
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[bold red]Error:[/bold red] Usage: cancel <job_id|#local_id>")
+                    else:
+                        job_id = parts[1]
+                        result = scheduler.cancel_job(job_id)
+                        if "error" in result:
+                            console.print(f"[bold red]Error:[/bold red] {result['error']}")
+                        else:
+                            console.print(f"Job cancelled: #{result['local_id']} [cyan]{result['job_id']}[/cyan]")
+                elif user_input.lower().startswith("kill "):
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[bold red]Error:[/bold red] Usage: kill <job_id|#local_id>")
+                    else:
+                        job_id = parts[1]
+                        result = scheduler.kill_job(job_id)
+                        if "error" in result:
+                            console.print(f"[bold red]Error:[/bold red] {result['error']}")
+                        else:
+                            console.print(f"Job killed: #{result['local_id']} [cyan]{result['job_id']}[/cyan]")
                 elif user_input:  # Only show error for non-empty input
                     console.print("[bold red]Unknown command.[/bold red] Type [cyan]help[/cyan] for available commands.")
             except KeyboardInterrupt:
