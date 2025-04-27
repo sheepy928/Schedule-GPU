@@ -613,6 +613,7 @@ class GPUJobScheduler:
         while not self.stop_event.is_set():
             job_acquired = False
             job_id = None # Reset job_id for each attempt
+            task_marked_done = False # Flag to track if task_done() was called for this job
             try:
                 # Check if GPU is available for processing jobs
                 with self.gpu_locks[gpu_id]: # Lock needed to read/write gpu_status safely
@@ -645,7 +646,11 @@ class GPUJobScheduler:
                     # Check if this job has been cancelled already
                     if self.job_status.get(job_id) == "cancelled":
                         # Job was cancelled while in queue, don't process it
-                        self.queue.task_done()  # Mark it as done in the queue
+                        try:
+                            self.queue.task_done()  # Mark it as done in the queue
+                            task_marked_done = True # Mark done
+                        except ValueError:
+                            console.print(f"[bold red]Error:[/bold red] task_done() failed for cancelled job {job_id} (before execution)")
                         job_acquired = False  # Reset flag since we've handled it
                         job_id = None # Clear job_id
                         continue
@@ -656,7 +661,6 @@ class GPUJobScheduler:
                         # Job has a specific GPU preference and it's not this GPU
                         # Put job back in queue and skip
                         self.queue.put((priority, local_id, job_id, command))
-                        self.queue.task_done()  # Mark it as done for this attempt
                         job_acquired = False  # Reset flag since we've handled it
                         job_id = None # Clear job_id
                         continue
@@ -673,7 +677,6 @@ class GPUJobScheduler:
                         # GPU became occupied/reserved while we were waiting
                         # Put job back in queue and skip
                         self.queue.put((priority, local_id, job_id, command))
-                        self.queue.task_done()  # Mark it as done for this attempt
                         job_acquired = False  # Reset flag since we've handled it
                         job_id = None # Clear job_id
                         time.sleep(0.5) # Short sleep before retrying
@@ -682,7 +685,11 @@ class GPUJobScheduler:
                     # Check again if job has been cancelled (last check before running)
                     if self.job_status.get(job_id) == "cancelled":
                         # Job was cancelled while we were checking GPU status
-                        self.queue.task_done()  # Mark it as done in the queue
+                        try:
+                            self.queue.task_done()  # Mark it as done in the queue
+                            task_marked_done = True # Mark done
+                        except ValueError:
+                            console.print(f"[bold red]Error:[/bold red] task_done() failed for cancelled job {job_id} (before execution, after lock)")
                         job_acquired = False  # Reset flag since we've handled it
                         job_id = None # Clear job_id
                         continue
@@ -770,10 +777,16 @@ class GPUJobScheduler:
                             console.print(f"GPU {gpu_id} status after job: [{status_color}]{current_status}[/{status_color}]")
 
                     # Job was successfully processed or handled (even if failed/killed), mark it as done in the queue
-                    if job_acquired:
-                        self.queue.task_done()
-                        job_acquired = False # Reset flag
-                        job_id = None # Clear job_id
+                    if job_acquired and not task_marked_done: # Check if acquired AND not already marked done
+                        try:
+                            self.queue.task_done()
+                            task_marked_done = True # Mark as done here
+                        except ValueError:
+                             console.print(f"[bold red]Error:[/bold red] task_done() failed in inner finally for job {job_id} on GPU {gpu_id}")
+                        # Reset flags now handled in outer finally
+
+                    # Clear job_id reference after handling
+                    job_id = None
 
             except Exception as e:
                 console.print(f"[bold red]Error[/bold red] in GPU worker {gpu_id}: {e}")
@@ -788,15 +801,21 @@ class GPUJobScheduler:
                      console.print(f"[bold red]Error updating GPU {gpu_id} status after worker error:[/bold red] {e_inner}")
 
             finally:
-                # If we got a job from the queue but didn't process it due to an exception,
+                # If we got a job from the queue but didn't mark it done (e.g., due to exception BEFORE inner finally)
                 # make sure we mark it as done to avoid queue getting stuck
-                if job_acquired and job_id is not None: # Check job_id is not None here
+                if job_acquired and not task_marked_done: # Check if acquired AND not already marked done
                     try:
                         self.queue.task_done()
-                    except ValueError: # Can happen if task_done() called too many times
-                        pass
-                    job_acquired = False # Reset flag
-                    job_id = None # Clear job_id
+                        task_marked_done = True # Mark done here
+                    except ValueError: # Can happen if task_done() called too many times (indicates logic error)
+                        console.print(f"[bold red]Error:[/bold red] task_done() failed unexpectedly in outer finally for job {job_id} on GPU {gpu_id}")
+                    # Reset flags associated with the job attempt
+                    job_acquired = False
+                    job_id = None
+                elif task_marked_done: # If already marked done, still ensure flags are reset
+                     job_acquired = False
+                     job_id = None
+                # If !job_acquired (never got a job), flags are already False/None
 
 
     def get_status(self, job_id: Optional[str] = None, include_cancelled: bool = False) -> Dict:
