@@ -866,11 +866,12 @@ class InteractiveCLI:
 class SchedulerServer:
     """TCP server for remote scheduler access"""
     
-    def __init__(self, scheduler: GPUScheduler, host: str = "localhost", port: int = 5555):
+    def __init__(self, scheduler: GPUScheduler, host: str = "localhost", port: int = 8000, debug: bool = False):
         self.scheduler = scheduler
         self.processor = CommandProcessor(scheduler)
         self.host = host
         self.port = port
+        self.debug = debug
         self.logger = logging.getLogger(__name__)
         self.should_stop = threading.Event()
         
@@ -885,11 +886,16 @@ class SchedulerServer:
             server_socket.settimeout(1.0)
             
             self.logger.info(f"Server listening on {self.host}:{self.port}")
+            if self.debug:
+                self.logger.debug("Debug mode enabled - verbose logging active")
             
             while not self.should_stop.is_set():
                 try:
                     client_socket, client_addr = server_socket.accept()
                     self.logger.info(f"Client connected from {client_addr}")
+                    
+                    if self.debug:
+                        self.logger.debug(f"Socket details - local: {client_socket.getsockname()}, remote: {client_addr}")
                     
                     # Handle client in separate thread
                     client_thread = threading.Thread(
@@ -898,6 +904,9 @@ class SchedulerServer:
                         daemon=True
                     )
                     client_thread.start()
+                    
+                    if self.debug:
+                        self.logger.debug(f"Started handler thread for client {client_addr}")
                     
                 except socket.timeout:
                     continue
@@ -909,26 +918,55 @@ class SchedulerServer:
     
     def _handle_client(self, client_socket: socket.socket):
         """Handle a client connection"""
+        client_addr = client_socket.getpeername()
         try:
             while True:
                 # Receive command
-                data = client_socket.recv(4096).decode('utf-8').strip()
-                if not data:
+                raw_data = client_socket.recv(4096)
+                if not raw_data:
+                    if self.debug:
+                        self.logger.debug(f"Client {client_addr} disconnected - empty data")
                     break
                 
+                # Decode and strip data
+                data = raw_data.decode('utf-8').strip()
+                
+                if self.debug:
+                    self.logger.debug(f"Received from {client_addr}: Raw bytes: {raw_data!r}")
+                    self.logger.debug(f"Received from {client_addr}: Decoded: '{data}'")
+                
+                if not data:
+                    if self.debug:
+                        self.logger.debug(f"Client {client_addr} sent empty string after stripping")
+                    continue
+                
                 # Process command
+                if self.debug:
+                    self.logger.debug(f"Processing command from {client_addr}: '{data}'")
+                
                 result = self.processor.process_command(data)
                 
                 # Send response
                 response = json.dumps({"result": result}) + "\n"
+                
+                if self.debug:
+                    self.logger.debug(f"Sending response to {client_addr}: '{response.strip()}'")
+                
                 client_socket.send(response.encode('utf-8'))
                 
                 if result == "EXIT":
+                    if self.debug:
+                        self.logger.debug(f"Client {client_addr} requested exit")
                     break
                     
         except Exception as e:
-            self.logger.error(f"Client handler error: {e}")
+            self.logger.error(f"Client handler error for {client_addr}: {e}")
+            if self.debug:
+                import traceback
+                self.logger.debug(f"Traceback: {traceback.format_exc()}")
         finally:
+            if self.debug:
+                self.logger.debug(f"Closing connection to {client_addr}")
             client_socket.close()
     
     def stop(self):
@@ -941,15 +979,20 @@ def main():
     parser = argparse.ArgumentParser(description="GPU Job Scheduler")
     parser.add_argument("--server", action="store_true", help="Run in server mode only")
     parser.add_argument("--host", default="localhost", help="Server host (default: localhost)")
-    parser.add_argument("--port", type=int, default=5555, help="Server port (default: 5555)")
+    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     parser.add_argument("--command", help="Execute a single command and exit")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode for verbose logging")
     
     args = parser.parse_args()
     
     # Setup logging
+    log_level = args.log_level
+    if args.debug:
+        log_level = "DEBUG"
+    
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
+        level=getattr(logging, log_level.upper()),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
@@ -966,8 +1009,8 @@ def main():
     
     # Start server if requested
     server = None
-    if args.server or args.host != "localhost" or args.port != 5555:
-        server = SchedulerServer(scheduler, args.host, args.port)
+    if args.server or args.host != "localhost" or args.port != 8000:
+        server = SchedulerServer(scheduler, args.host, args.port, debug=args.debug)
         server_thread = threading.Thread(target=server.run, daemon=True)
         server_thread.start()
     
